@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OutputType>Library</OutputType>
+    <AssemblyName>Pedal Chorus.NET</AssemblyName>
+    <RootNamespace>WDE.PedalChorus</RootNamespace>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Optimize>true</Optimize>
+
+    <!--
+      Output goes straight into the ReBuzz Effects gear folder.
+      Override BuzzDir on the command line if ReBuzz is installed elsewhere:
+        dotnet build PedalChorus.csproj -c Release /p:BuzzDir="D:\ReBuzz"
+    -->
+    <BuzzDir Condition="'$(BuzzDir)' == ''">C:\Program Files\ReBuzz</BuzzDir>
+    <OutputPath>$(BuzzDir)\Gear\Effects</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+
+    <AssemblyTitle>Pedal Chorus</AssemblyTitle>
+    <Company>WDE</Company>
+    <Product>Pedal Chorus</Product>
+    <Description>4-voice stereo chorus for ReBuzz — optimised for drum sounds</Description>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <!--
+    ReBuzz managed-machine API DLLs — NOT on NuGet, they ship with ReBuzz.
+    HintPath resolves via $(BuzzDir) defined above.
+    Private=false means they will NOT be copied into the output folder
+    (ReBuzz already has them at runtime).
+  -->
+  <ItemGroup>
+    <Reference Include="ReBuzz">
+      <HintPath>$(BuzzDir)\ReBuzz.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BuzzGUI.Interfaces">
+      <HintPath>$(BuzzDir)\BuzzGUI.Interfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
