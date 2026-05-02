@@ -13,6 +13,12 @@
 //   A gentle one-pole low-pass (Tone) rolls off the top octave of the wet
 //   signal, keeping hi-hat transients tight while kick / snare stay thick.
 //
+// CPU saving:
+//   When ReBuzz delivers WM_NOIO the machine returns false immediately.
+//   When real input goes silent the machine keeps running until the chorus
+//   tail (max delay + depth + one extra buffer of headroom) has cleared,
+//   then returns false so ReBuzz can skip it on subsequent silent buffers.
+//
 // Build:
 //   dotnet build PedalChorus.csproj -c Release
 //   → C:\Program Files\ReBuzz\Gear\Effects\Pedal Chorus.NET.dll
@@ -36,7 +42,7 @@ namespace WDE.PedalChorus
         // ── Ring buffer ───────────────────────────────────────────────────────
         // Power-of-two length → fast modulo via bitwise AND.
         // 65 536 samples ≈ 1 365 ms @ 48 kHz — well beyond any chorus delay.
-        const int  BUF_MASK = 65535;
+        const int BUF_MASK = 65535;
         readonly float[] bufL = new float[BUF_MASK + 1];
         readonly float[] bufR = new float[BUF_MASK + 1];
         int writePos;
@@ -45,9 +51,27 @@ namespace WDE.PedalChorus
         const int VOICES = 4;
         readonly double[] lfoPhase = new double[VOICES];
 
-        // ── Tone filter state (one-pole LP on the wet path) ───────────────────
+        // ── Tone filter state (one-pole LP on the wet path only) ─────────────
         float toneStateL;
         float toneStateR;
+
+        // ── Silence / tail tracking ───────────────────────────────────────────
+        // How long to keep running after input goes quiet so the chorus tail
+        // (the delayed copies still in the ring buffer) can clear.
+        // Max tail = BaseDelayMs(25) + Depth modulation(8) = 33 ms.
+        // We add a generous safety margin: 100 ms expressed in samples,
+        // recomputed each block from the current sample rate.
+        // _tailCountdown counts down in samples; when it reaches 0 and input
+        // is still silent we return false to save CPU.
+        int  _tailCountdown;
+        bool _inputWasSilent;
+
+        // Threshold below which a sample is considered silent (−90 dBFS ≈ 3e-5).
+        const float SILENCE_THRESHOLD = 3e-5f;
+
+        // Tail hold time in ms — covers the longest possible delay + modulation
+        // depth plus margin.  Recalculated to samples each block.
+        const float TAIL_HOLD_MS = 100f;
 
         public PedalChorusMachine(IBuzzMachineHost host)
         {
@@ -124,15 +148,61 @@ namespace WDE.PedalChorus
 
         // =========================================================================
         // Audio processing
-        // NOTE: ReBuzz effect signature — output first, then input.
-        // Return true if output contains audio; false for silence.
         // =========================================================================
 
         public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
         {
+            // ── Fast path: ReBuzz signals no I/O this buffer ──────────────────
+            // No need to touch the ring buffer or LFOs — they stay where they
+            // are and will resume correctly when signal returns.
             if (mode == WorkModes.WM_NOIO) return false;
 
             int sr = host.MasterInfo.SamplesPerSec;
+
+            // ── Silence detection ─────────────────────────────────────────────
+            // Scan input for any sample above the silence floor.
+            bool inputSilent = true;
+            for (int i = 0; i < n; i++)
+            {
+                if (Math.Abs(input[i].L) > SILENCE_THRESHOLD ||
+                    Math.Abs(input[i].R) > SILENCE_THRESHOLD)
+                {
+                    inputSilent = false;
+                    break;
+                }
+            }
+
+            if (!inputSilent)
+            {
+                // Live signal: reset the tail countdown so we keep running for
+                // the full tail duration after this burst of input ends.
+                _tailCountdown  = (int)(TAIL_HOLD_MS * sr / 1000f) + n;
+                _inputWasSilent = false;
+            }
+            else
+            {
+                // Input is silent this buffer.
+                if (_tailCountdown > 0)
+                {
+                    // Still within the tail hold window — keep processing so
+                    // the delayed copies in the ring buffer can play out.
+                    _tailCountdown -= n;
+                    if (_tailCountdown < 0) _tailCountdown = 0;
+                }
+                else
+                {
+                    // Tail has fully cleared.  Zero the tone-filter state so it
+                    // doesn't inject a DC offset when signal returns, then tell
+                    // ReBuzz we produced silence — it can skip us next buffer.
+                    if (!_inputWasSilent)
+                    {
+                        toneStateL      = 0f;
+                        toneStateR      = 0f;
+                        _inputWasSilent = true;
+                    }
+                    return false;
+                }
+            }
 
             // ── Map parameters once per block ─────────────────────────────────
 
@@ -154,11 +224,10 @@ namespace WDE.PedalChorus
             float toneFreq  = (float)(22000.0 - Tone / 100.0 * 20000.0);
             float toneCoeff = 1.0f - (float)Math.Exp(-2.0 * Math.PI * toneFreq / sr);
 
-            // Equal-power pan table — voices spread across field
-            // positions: −1, −0.33, +0.33, +1  scaled by Spread
+            // Equal-power pan table — voices spread across the stereo field.
+            // Positions: −1, −0.33, +0.33, +1  scaled by Spread.
             float sp = Spread / 100.0f;
-            float[] pos = { -sp, -sp * 0.333f, sp * 0.333f, sp };
-
+            float[] pos  = { -sp, -sp * 0.333f, sp * 0.333f, sp };
             float[] panL = new float[VOICES];
             float[] panR = new float[VOICES];
             for (int v = 0; v < VOICES; v++)
@@ -168,7 +237,7 @@ namespace WDE.PedalChorus
                 panR[v] = (float)Math.Sin(angle);
             }
 
-            // Voice gain: ×2 compensates for the mono-sum halving
+            // Gain per voice: ×2 compensates for the mono-sum halving.
             float voiceGain = 2.0f / VOICES;
 
             // ── Sample loop ───────────────────────────────────────────────────
@@ -177,7 +246,7 @@ namespace WDE.PedalChorus
                 float inL = input[i].L;
                 float inR = input[i].R;
 
-                // Write dry signal into ring buffer
+                // Write dry signal into the ring buffer
                 bufL[writePos] = inL;
                 bufR[writePos] = inR;
 
